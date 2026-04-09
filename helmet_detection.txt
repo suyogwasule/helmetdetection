@@ -1,0 +1,1241 @@
+"""
+
+=============================================================================
+
+ HELMET DETECTION & TRAFFIC VIOLATION SYSTEM  v3
+
+=============================================================================
+
+
+
+ Pipeline:
+
+   Video Frame
+
+     → Horizon Crop (remove sky)
+
+     → Model 1: rider_model.pt  →  rider bounding boxes (bb1)
+
+     → For each bb1:
+
+         → Model 2: helmet_model.pt on bb1 region
+
+         → If NO helmet detected:
+
+             → VIOLATION flagged
+
+             → Model 3: plate_model.pt on bb1 region
+
+             → Crop plate bbox → save → OCR
+
+     → Temporal dedup (don't log same rider twice)
+
+     → Output: annotated video + violations.csv + violation frames
+
+
+
+ Models:
+
+   rider_model.pt   — {0: 'rider'}
+
+   helmet_model.pt  — {0: 'With Helmet', 1: 'Without Helmet'}
+
+   plate_model.pt   — {0: 'number-plate'}
+
+=============================================================================
+
+"""
+
+
+
+import os
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+
+
+import cv2
+
+import numpy as np
+
+import csv
+
+import time
+
+import re
+
+from datetime import datetime
+
+from pathlib import Path
+
+from collections import defaultdict
+
+
+
+from ultralytics import YOLO
+
+import easyocr
+
+
+
+# Try to import torch for GPU check
+
+try:
+
+    import torch
+
+    HAS_CUDA = torch.cuda.is_available()
+
+except ImportError:
+
+    HAS_CUDA = False
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# CONFIGURATION
+
+# ─────────────────────────────────────────────
+
+BASE_DIR = Path(__file__).parent
+
+MODELS_DIR = BASE_DIR / "models"
+
+
+
+RIDER_MODEL_PATH  = str(MODELS_DIR / "rider_model.pt")
+
+HELMET_MODEL_PATH = str(MODELS_DIR / "helmet_model.pt")
+
+PLATE_MODEL_PATH  = str(MODELS_DIR / "plate_model.pt")
+
+
+
+OUTPUT_DIR = BASE_DIR / "output"
+
+VIOLATIONS_CSV = OUTPUT_DIR / "violations.csv"
+
+VIOLATION_FRAMES_DIR = OUTPUT_DIR / "violation_frames"
+
+PLATE_CROPS_DIR = OUTPUT_DIR / "plate_crops"
+
+
+
+# ── Thresholds ──
+
+HORIZON_CROP_RATIO    = 0.30   # Remove top 30 % of frame
+
+RIDER_CONF            = 0.25
+
+HELMET_CONF           = 0.25
+
+PLATE_CONF            = 0.25
+
+
+
+# ── Performance ──
+
+PROCESS_EVERY_N       = 3      # Run detection every Nth frame
+
+USE_HALF              = True   # FP16 on GPU (2× speed)
+
+
+
+# ── Tracker ──
+
+TRACK_IOU_THRESH      = 0.25
+
+VIOLATION_COOLDOWN    = 50     # Frames before same rider can be re-logged
+
+MIN_STREAK            = 2      # Need N consecutive "no helmet" before logging
+
+
+
+# ── Padding for sub-crops ──
+
+HELMET_PAD_RATIO      = 0.25   # Expand rider bbox by 25 % before helmet check
+
+PLATE_PAD_RATIO       = 0.15   # Expand rider bbox by 15 % before plate check
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# SETUP HELPERS
+
+# ─────────────────────────────────────────────
+
+
+
+def setup_dirs():
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    VIOLATION_FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+
+    PLATE_CROPS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+
+
+
+def init_csv():
+
+    """Fresh CSV each run."""
+
+    with open(VIOLATIONS_CSV, "w", newline="", encoding="utf-8") as f:
+
+        csv.writer(f).writerow([
+
+            "Violation_ID", "Timestamp", "Frame",
+
+            "Rider_BBox", "Helmet_Status", "Helmet_Conf",
+
+            "Plate_Text", "Plate_Conf", "Frame_Path", "Plate_Crop_Path",
+
+        ])
+
+
+
+
+
+def log_violation(vid, frame_num, bbox, h_status, h_conf,
+
+                  plate_text, plate_conf, frame_path, plate_path):
+
+    with open(VIOLATIONS_CSV, "a", newline="", encoding="utf-8") as f:
+
+        csv.writer(f).writerow([
+
+            vid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), frame_num,
+
+            str(bbox), h_status, f"{h_conf:.3f}",
+
+            plate_text, f"{plate_conf:.3f}",
+
+            str(frame_path), str(plate_path),
+
+        ])
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# GEOMETRY UTILS
+
+# ─────────────────────────────────────────────
+
+
+
+def compute_iou(a, b):
+
+    x1 = max(a[0], b[0]); y1 = max(a[1], b[1])
+
+    x2 = min(a[2], b[2]); y2 = min(a[3], b[3])
+
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+
+    ua = (a[2]-a[0])*(a[3]-a[1])
+
+    ub = (b[2]-b[0])*(b[3]-b[1])
+
+    return inter / max(1, ua + ub - inter)
+
+
+
+
+
+def pad_box(box, pad_ratio, img_h, img_w):
+
+    """Expand box by pad_ratio on each side, clamp to image."""
+
+    x1, y1, x2, y2 = box
+
+    bw = x2 - x1; bh = y2 - y1
+
+    px = int(bw * pad_ratio)
+
+    py = int(bh * pad_ratio)
+
+    return [
+
+        max(0, x1 - px), max(0, y1 - py),
+
+        min(img_w, x2 + px), min(img_h, y2 + py),
+
+    ]
+
+
+
+
+
+def crop_region(img, box):
+
+    """Safely crop img[y1:y2, x1:x2]."""
+
+    x1, y1, x2, y2 = box
+
+    c = img[y1:y2, x1:x2]
+
+    return c if c.size > 0 else None
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# SIMPLE TRACKER
+
+# ─────────────────────────────────────────────
+
+
+
+class Tracker:
+
+    """Lightweight IoU tracker for frame-to-frame dedup."""
+
+
+
+    def __init__(self):
+
+        self._next = 1
+
+        self._tracks = {}               # tid → {bbox, last_frame}
+
+        self._streak = defaultdict(int)  # tid → consecutive no-helmet count
+
+        self._logged = {}                # tid → last logged frame
+
+
+
+    def update(self, dets, frame_num):
+
+        """Match dets to tracks. Returns [(tid, det), ...]."""
+
+        # Prune stale
+
+        self._tracks = {t: v for t, v in self._tracks.items()
+
+                        if frame_num - v["f"] <= 40}
+
+
+
+        tids = list(self._tracks.keys())
+
+        matched, used = [], set()
+
+
+
+        if tids and dets:
+
+            ious = np.zeros((len(tids), len(dets)))
+
+            for i, t in enumerate(tids):
+
+                for j, d in enumerate(dets):
+
+                    ious[i, j] = compute_iou(self._tracks[t]["b"], d["bbox"])
+
+
+
+            while True:
+
+                if ious.size == 0:
+
+                    break
+
+                best = np.unravel_index(np.argmax(ious), ious.shape)
+
+                if ious[best] < TRACK_IOU_THRESH:
+
+                    break
+
+                tid = tids[best[0]]
+
+                self._tracks[tid] = {"b": dets[best[1]]["bbox"], "f": frame_num}
+
+                matched.append((tid, dets[best[1]]))
+
+                used.add(best[1])
+
+                ious[best[0], :] = -1
+
+                ious[:, best[1]] = -1
+
+
+
+        for j in range(len(dets)):
+
+            if j not in used:
+
+                tid = self._next; self._next += 1
+
+                self._tracks[tid] = {"b": dets[j]["bbox"], "f": frame_num}
+
+                matched.append((tid, dets[j]))
+
+
+
+        return matched
+
+
+
+    def should_log(self, tid, frame_num, is_violation):
+
+        if not is_violation:
+
+            self._streak[tid] = 0
+
+            return False
+
+        self._streak[tid] += 1
+
+        if self._streak[tid] < MIN_STREAK:
+
+            return False
+
+        last = self._logged.get(tid, -999)
+
+        if frame_num - last < VIOLATION_COOLDOWN:
+
+            return False
+
+        self._logged[tid] = frame_num
+
+        return True
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# DETECTION FUNCTIONS
+
+# ─────────────────────────────────────────────
+
+
+
+def detect_riders(model, frame, use_half=False):
+
+    """Run rider_model on frame. Returns list of {bbox, confidence}."""
+
+    results = model(frame, conf=RIDER_CONF, half=use_half, verbose=False)
+
+    dets = []
+
+    if results and len(results[0].boxes) > 0:
+
+        for box in results[0].boxes:
+
+            xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
+
+            conf = float(box.conf[0].item())
+
+            dets.append({"bbox": xyxy, "confidence": conf})
+
+    return dets
+
+
+
+
+
+def check_helmet_in_bbox(model, frame, rider_bbox, pad_ratio=None, use_half=False):
+
+    """
+
+    Run helmet_model INSIDE the rider's bounding box (with padding).
+
+    Returns (status, confidence, helmet_bbox_fullframe):
+
+        status: "With Helmet" / "Without Helmet" / "Unknown"
+
+        confidence: float
+
+        helmet_bbox_fullframe: [x1,y1,x2,y2] in original frame coords, or None
+
+    """
+
+    if pad_ratio is None:
+
+        pad_ratio = HELMET_PAD_RATIO
+
+    h, w = frame.shape[:2]
+
+    padded = pad_box(rider_bbox, pad_ratio, h, w)
+
+    crop = crop_region(frame, padded)
+
+    if crop is None or crop.shape[0] < 20 or crop.shape[1] < 20:
+
+        return "Unknown", 0.0, None
+
+
+
+    results = model(crop, conf=HELMET_CONF, half=use_half, verbose=False)
+
+
+
+    if results and len(results[0].boxes) > 0:
+
+        boxes = results[0].boxes
+
+        best_i = boxes.conf.argmax().item()
+
+        cls_id = int(boxes.cls[best_i].item())
+
+        conf   = float(boxes.conf[best_i].item())
+
+        name   = results[0].names[cls_id].strip().lower()
+
+
+
+        # Helmet bbox in crop coords → full frame coords
+
+        hb = boxes.xyxy[best_i].cpu().numpy().astype(int).tolist()
+
+        helmet_ff = [padded[0]+hb[0], padded[1]+hb[1],
+
+                     padded[0]+hb[2], padded[1]+hb[3]]
+
+
+
+        if ("without" in name or "no" in name) and "helmet" in name:
+
+            return "Without Helmet", conf, helmet_ff
+
+        if "helmet" in name:
+
+            return "With Helmet", conf, helmet_ff
+
+        return name, conf, helmet_ff
+
+
+
+    return "Unknown", 0.0, None
+
+
+
+
+
+def detect_plate_in_bbox(model, frame, rider_bbox, use_half=False):
+
+    """
+
+    Run plate_model INSIDE the rider's bounding box.
+
+    Returns (plate_crop, plate_bbox_abs, confidence) or (None, None, 0).
+
+    """
+
+    h, w = frame.shape[:2]
+
+    padded = pad_box(rider_bbox, PLATE_PAD_RATIO, h, w)
+
+    roi = crop_region(frame, padded)
+
+    if roi is None:
+
+        return None, None, 0.0
+
+
+
+    results = model(roi, conf=PLATE_CONF, half=use_half, verbose=False)
+
+    if results and len(results[0].boxes) > 0:
+
+        boxes = results[0].boxes
+
+        best_i = boxes.conf.argmax().item()
+
+        pb = boxes.xyxy[best_i].cpu().numpy().astype(int)
+
+        conf = float(boxes.conf[best_i].item())
+
+
+
+        plate_crop = roi[max(0,pb[1]):max(0,pb[3]), max(0,pb[0]):max(0,pb[2])]
+
+        if plate_crop.size == 0:
+
+            return None, None, 0.0
+
+
+
+        # Absolute coordinates
+
+        abs_box = [padded[0]+pb[0], padded[1]+pb[1],
+
+                   padded[0]+pb[2], padded[1]+pb[3]]
+
+        return plate_crop, abs_box, conf
+
+
+
+    return None, None, 0.0
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# OCR
+
+# ─────────────────────────────────────────────
+
+
+
+def preprocess_plate(img):
+
+    """CLAHE + bilateral + Otsu for clean OCR input."""
+
+    if img is None or img.size == 0:
+
+        return None
+
+    h, w = img.shape[:2]
+
+    if h < 8 or w < 8:
+
+        return None
+
+    # Resize to standard height
+
+    scale = 64 / h
+
+    resized = cv2.resize(img, (int(w*scale), 64), interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+
+    enhanced = clahe.apply(gray)
+
+    filtered = cv2.bilateralFilter(enhanced, 9, 75, 75)
+
+    _, binary = cv2.threshold(filtered, 0, 255,
+
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+
+    return cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+
+
+
+
+def read_plate(ocr, plate_crop):
+
+    """Run OCR on plate crop. Returns (text, confidence)."""
+
+    if plate_crop is None or plate_crop.size == 0:
+
+        return "", 0.0
+
+
+
+    allow = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+    best_text, best_conf = "", 0.0
+
+
+
+    # Try enhanced preprocessing
+
+    proc = preprocess_plate(plate_crop)
+
+    if proc is not None:
+
+        res = ocr.readtext(proc, allowlist=allow)
+
+        if res:
+
+            t = re.sub(r'[^A-Z0-9 ]', '', " ".join(r[1] for r in res).upper()).strip()
+
+            c = sum(r[2] for r in res) / len(res)
+
+            if c > best_conf and len(t) >= 2:
+
+                best_text, best_conf = t, c
+
+
+
+    # Fallback — plain grayscale
+
+    g = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+
+    h, w = g.shape
+
+    if h > 8 and w > 8:
+
+        s = max(1.0, 64 / h)
+
+        gs = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_CUBIC)
+
+        res2 = ocr.readtext(gs, allowlist=allow)
+
+        if res2:
+
+            t = re.sub(r'[^A-Z0-9 ]', '', " ".join(r[1] for r in res2).upper()).strip()
+
+            c = sum(r[2] for r in res2) / len(res2)
+
+            if c > best_conf and len(t) >= 2:
+
+                best_text, best_conf = t, c
+
+
+
+    return best_text, best_conf
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# DRAWING
+
+# ─────────────────────────────────────────────
+
+
+
+def draw(frame, tracked, violations):
+
+    """Draw bboxes: green=helmet, red=no helmet, yellow=unknown.
+
+    Also draws the helmet detection bbox inside the rider box."""
+
+    for tid, det, status, conf, ff, h_bbox in tracked:
+
+        x1, y1, x2, y2 = ff
+
+
+
+        # ── Rider bbox ──
+
+        if status == "Without Helmet":
+
+            col, th = (0, 0, 255), 3
+
+            lbl = f"ID:{tid} NO HELMET {conf:.2f}"
+
+        elif status == "With Helmet":
+
+            col, th = (0, 200, 0), 2
+
+            lbl = f"ID:{tid} HELMET {conf:.2f}"
+
+        else:
+
+            col, th = (0, 220, 255), 2
+
+            lbl = f"ID:{tid} Rider {det['confidence']:.2f}"
+
+
+
+        cv2.rectangle(frame, (x1, y1), (x2, y2), col, th)
+
+        (tw, tht), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+
+        cv2.rectangle(frame, (x1, y1-tht-8), (x1+tw+4, y1), col, -1)
+
+        cv2.putText(frame, lbl, (x1+2, y1-4),
+
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
+
+
+
+        # ── Helmet bbox (inside rider) ──
+
+        if h_bbox is not None:
+
+            hx1, hy1, hx2, hy2 = h_bbox
+
+            if status == "Without Helmet":
+
+                h_col = (0, 0, 255)      # Red
+
+                h_lbl = "No Helmet"
+
+            else:
+
+                h_col = (0, 255, 0)      # Green
+
+                h_lbl = "Helmet"
+
+            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), h_col, 2)
+
+            cv2.putText(frame, h_lbl, (hx1, hy1 - 4),
+
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, h_col, 1, cv2.LINE_AA)
+
+
+
+    for v in violations:
+
+        b = v["ff"]
+
+        ptxt = f"PLATE: {v.get('plate_text') or 'N/A'}"
+
+        cv2.putText(frame, ptxt, (b[0], b[3]+18),
+
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,165,255), 2, cv2.LINE_AA)
+
+
+
+    return frame
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# MAIN PIPELINE
+
+# ─────────────────────────────────────────────
+
+
+
+def run(video_source=0, show=True, save=True, out_fps=None):
+
+    print("=" * 60)
+
+    print(" HELMET VIOLATION DETECTION v3")
+
+    print("=" * 60)
+
+
+
+    # GPU check
+
+    if HAS_CUDA:
+
+        gpu_name = torch.cuda.get_device_name(0)
+
+        print(f"  GPU: {gpu_name}  ✓  (FP16={'ON' if USE_HALF else 'OFF'})")
+
+    else:
+
+        print("  ⚠  NO GPU — running on CPU (will be slow)")
+
+        print("  Fix: activate your venv first:")
+
+        print("    ..\\myenv\\Scripts\\Activate.ps1")
+
+
+
+    use_half = USE_HALF and HAS_CUDA
+
+
+
+    setup_dirs()
+
+    init_csv()
+
+
+
+    # ── Models ──
+
+    print("\n  Loading rider_model.pt ...", end=" ", flush=True)
+
+    rider_m = YOLO(RIDER_MODEL_PATH)
+
+    print(f"✓  {rider_m.names}")
+
+
+
+    print("  Loading helmet_model.pt ...", end=" ", flush=True)
+
+    helmet_m = YOLO(HELMET_MODEL_PATH)
+
+    print(f"✓  {helmet_m.names}")
+
+
+
+    print("  Loading plate_model.pt ...", end=" ", flush=True)
+
+    plate_m = YOLO(PLATE_MODEL_PATH)
+
+    print(f"✓  {plate_m.names}")
+
+
+
+    print("  Loading EasyOCR ...", end=" ", flush=True)
+
+    ocr = easyocr.Reader(["en"], gpu=HAS_CUDA)
+
+    print("✓")
+
+
+
+    tracker = Tracker()
+
+
+
+    # ── Video ──
+
+    if isinstance(video_source, int):
+
+        cap = cv2.VideoCapture(video_source, cv2.CAP_MSMF)
+
+        if not cap.isOpened():
+
+            cap = cv2.VideoCapture(video_source, cv2.CAP_DSHOW)
+
+    else:
+
+        cap = cv2.VideoCapture(video_source)
+
+
+
+    if not cap.isOpened():
+
+        print("ERROR: cannot open video source"); return
+
+
+
+    fps_src = float(cap.get(cv2.CAP_PROP_FPS) or 30)
+
+    fps = float(out_fps) if out_fps else (fps_src if fps_src > 1 else 30)
+
+    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+
+    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    print(f"\n  Video: {W}×{H} @ {fps:.0f} FPS  |  {total} frames")
+
+    print(f"  Detect every {PROCESS_EVERY_N} frames  →  ~{fps/PROCESS_EVERY_N:.0f} effective FPS")
+
+
+
+    writer = None
+
+    if save:
+
+        op = str(OUTPUT_DIR / "annotated_output.mp4")
+
+        writer = cv2.VideoWriter(op, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+
+        print(f"  Output → {op}")
+
+
+
+    print("\n" + "=" * 60)
+
+    print("  RUNNING — press 'q' to quit")
+
+    print("=" * 60 + "\n")
+
+
+
+    fnum = 0
+
+    viol_count = 0
+
+    t0 = time.time()
+
+    cache_tracked = []
+
+    cache_viols = []
+
+
+
+    while True:
+
+        ok, frame = cap.read()
+
+        if not ok:
+
+            break
+
+        fnum += 1
+
+        do_detect = (fnum % PROCESS_EVERY_N == 0) or fnum <= 3
+
+
+
+        if do_detect:
+
+            orig = frame.copy()
+
+
+
+            # ── 1. Horizon crop ──
+
+            crop_y = int(H * HORIZON_CROP_RATIO)
+
+            cropped = frame[crop_y:, :]
+
+
+
+            # ── 2. Detect riders ──
+
+            riders = detect_riders(rider_m, cropped, use_half)
+
+
+
+            # ── 3. Track ──
+
+            matched = tracker.update(riders, fnum)
+
+
+
+            tracked_list = []
+
+            viol_list = []
+
+
+
+            for tid, det in matched:
+
+                # Full-frame bbox
+
+                bx = det["bbox"]
+
+                ff = [bx[0], bx[1] + crop_y, bx[2], bx[3] + crop_y]
+
+
+
+                # ── 4. Helmet check INSIDE rider bbox ──
+
+                h_status, h_conf, h_bbox = check_helmet_in_bbox(
+
+                    helmet_m, frame, ff, use_half=use_half
+
+                )
+
+
+
+                # Fallback: try again with larger padding if Unknown
+
+                if h_status == "Unknown":
+
+                    h_status, h_conf, h_bbox = check_helmet_in_bbox(
+
+                        helmet_m, frame, ff, pad_ratio=0.50, use_half=use_half
+
+                    )
+
+
+
+                tracked_list.append((tid, det, h_status, h_conf, ff, h_bbox))
+
+
+
+                # ── 5. Violation? ──
+
+                is_viol = (h_status == "Without Helmet")
+
+                if tracker.should_log(tid, fnum, is_viol):
+
+                    viol_count += 1
+
+                    plate_text, plate_conf = "", 0.0
+
+                    plate_crop_path = ""
+
+
+
+                    # ── 6. Plate detection INSIDE rider bbox ──
+
+                    plate_crop, plate_abs, plate_det_c = detect_plate_in_bbox(
+
+                        plate_m, frame, ff, use_half
+
+                    )
+
+
+
+                    # ── 7. Save plate crop & OCR ──
+
+                    if plate_crop is not None and plate_crop.size > 0:
+
+                        pc_path = PLATE_CROPS_DIR / f"plate_{viol_count}_f{fnum}.jpg"
+
+                        cv2.imwrite(str(pc_path), plate_crop)
+
+                        plate_crop_path = str(pc_path)
+
+                        plate_text, plate_conf = read_plate(ocr, plate_crop)
+
+
+
+                    # Save violation frame
+
+                    fp = VIOLATION_FRAMES_DIR / f"violation_{viol_count}_f{fnum}.jpg"
+
+                    cv2.imwrite(str(fp), orig)
+
+
+
+                    log_violation(viol_count, fnum, ff, h_status, h_conf,
+
+                                  plate_text, plate_conf, fp, plate_crop_path)
+
+
+
+                    viol_list.append({
+
+                        "tid": tid, "ff": ff,
+
+                        "plate_text": plate_text,
+
+                    })
+
+
+
+                    print(f"  🚨 #{viol_count} | Frame {fnum} | ID:{tid} | "
+
+                          f"{h_status} ({h_conf:.2f}) | Plate: {plate_text or 'N/A'}")
+
+
+
+            cache_tracked = tracked_list
+
+            cache_viols = viol_list
+
+
+
+        # ── Draw (every frame for smooth video) ──
+
+        ann = draw(frame, cache_tracked, cache_viols)
+
+        el = time.time() - t0
+
+        cfps = fnum / el if el > 0 else 0
+
+        cv2.putText(ann, f"Frame {fnum} | {cfps:.0f} FPS | Violations: {viol_count}",
+
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2, cv2.LINE_AA)
+
+
+
+        if writer:
+
+            writer.write(ann)
+
+
+
+        if show:
+
+            d = ann
+
+            if W > 1280 or H > 800:
+
+                s = min(1280/W, 800/H)
+
+                d = cv2.resize(ann, (int(W*s), int(H*s)))
+
+            cv2.imshow("Helmet Detection v3", d)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+
+                print("\n  [QUIT]"); break
+
+
+
+        if fnum % 200 == 0 and total > 0:
+
+            print(f"  📊 {fnum/total*100:.0f}% ({fnum}/{total}) | "
+
+                  f"{cfps:.0f} FPS | Violations: {viol_count}")
+
+
+
+    cap.release()
+
+    if writer:
+
+        writer.release()
+
+    cv2.destroyAllWindows()
+
+
+
+    el = time.time() - t0
+
+    print("\n" + "=" * 60)
+
+    print("  DONE")
+
+    print("=" * 60)
+
+    if el > 0:
+
+        print(f"  {fnum} frames | {el:.1f}s | {fnum/el:.0f} FPS")
+
+    print(f"  Violations: {viol_count}")
+
+    print(f"  CSV:   {VIOLATIONS_CSV}")
+
+    print(f"  Video: {OUTPUT_DIR / 'annotated_output.mp4'}")
+
+    print(f"  Plates: {PLATE_CROPS_DIR}")
+
+    print("=" * 60)
+
+
+
+
+
+# ─────────────────────────────────────────────
+
+# CLI
+
+# ─────────────────────────────────────────────
+
+
+
+if __name__ == "__main__":
+
+    import argparse
+
+    p = argparse.ArgumentParser(description="Helmet Detection v3")
+
+    p.add_argument("--source",     type=str,   default="0")
+
+    p.add_argument("--no-display", action="store_true")
+
+    p.add_argument("--no-save",    action="store_true")
+
+    p.add_argument("--output-fps", type=float, default=None)
+
+    p.add_argument("--skip",       type=int,   default=None,
+
+                   help=f"Process every N frames (default: {PROCESS_EVERY_N})")
+
+    a = p.parse_args()
+
+
+
+    if a.skip:
+
+        PROCESS_EVERY_N = a.skip
+
+
+
+    src = a.source
+
+    if src.isdigit():
+
+        src = int(src)
+
+
+
+    run(video_source=src, show=not a.no_display,
+
+        save=not a.no_save, out_fps=a.output_fps)
